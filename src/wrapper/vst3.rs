@@ -14,12 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use parking_lot::{RwLock, RwLockWriteGuard};
-use raw_window_handle::RawWindowHandle;
-use std::any::Any;
 use std::cmp;
-use std::collections::{HashMap, VecDeque};
-use std::ffi::{c_void, CStr};
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
@@ -27,7 +24,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tresult, TBool};
 use vst3_sys::base::{IBStream, IPluginBase, IPluginFactory, IPluginFactory2, IPluginFactory3};
-use vst3_sys::gui::IPlugView;
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
     IAudioProcessor, IComponent, IEditController, IEventList, IParamValueQueue, IParameterChanges,
@@ -36,22 +32,21 @@ use vst3_sys::vst::{
 use vst3_sys::VST3;
 use widestring::U16CStr;
 
+mod context;
 mod inner;
 #[macro_use]
 mod util;
+mod view;
 
 use self::inner::WrapperInner;
 use self::util::{VstPtr, BYPASS_PARAM_HASH};
-use crate::context::{EventLoop, ProcessContext};
+use self::view::WrapperView;
 use crate::param::internals::ParamPtr;
 use crate::param::range::Range;
 use crate::param::Param;
-use crate::plugin::{
-    BufferConfig, BusConfig, Editor, NoteEvent, Plugin, ProcessStatus, Vst3Plugin,
-};
+use crate::plugin::{BufferConfig, BusConfig, NoteEvent, Plugin, ProcessStatus, Vst3Plugin};
 use crate::wrapper::state::{ParamValue, State};
 use crate::wrapper::util::{process_wrapper, strlcpy, u16strlcpy};
-use crate::ParentWindowHandle;
 
 // Alias needed for the VST3 attribute macro
 use vst3_sys as vst3_com;
@@ -62,67 +57,14 @@ pub use vst3_sys::sys::GUID;
 /// The VST3 SDK version this is roughtly based on.
 const VST3_SDK_VERSION: &str = "VST 3.6.14";
 
-// Window handle type constants missing from vst3-sys
-#[allow(unused)]
-const VST3_PLATFORM_HWND: &str = "HWND";
-#[allow(unused)]
-const VST3_PLATFORM_HIVIEW: &str = "HIView";
-#[allow(unused)]
-const VST3_PLATFORM_NSVIEW: &str = "NSView";
-#[allow(unused)]
-const VST3_PLATFORM_UIVIEW: &str = "UIView";
-#[allow(unused)]
-const VST3_PLATFORM_X11_WINDOW: &str = "X11EmbedWindowID";
-
 #[VST3(implements(IComponent, IEditController, IAudioProcessor))]
 struct Wrapper<P: Plugin> {
     inner: Arc<WrapperInner<P>>,
 }
 
-/// The plugin's [IPlugView] instance created in [IEditController::create_view] if `P` has an
-/// editor. This is managed separately so the lifetime bounds match up.
-#[VST3(implements(IPlugView))]
-struct WrapperView<P: Plugin> {
-    inner: Arc<WrapperInner<P>>,
-    editor: Arc<dyn Editor>,
-    editor_handle: RwLock<Option<Box<dyn Any>>>,
-}
-
-/// A [ProcessContext] implementation for the wrapper. This is a separate object so it can hold on
-/// to lock guards for event queues. Otherwise reading these events would require constant
-/// unnecessary atomic operations to lock the uncontested RwLocks.
-pub(crate) struct WrapperProcessContext<'a, P: Plugin> {
-    inner: &'a WrapperInner<P>,
-    input_events_guard: RwLockWriteGuard<'a, VecDeque<NoteEvent>>,
-}
-
-impl<P: Plugin> ProcessContext for WrapperProcessContext<'_, P> {
-    fn set_latency_samples(&self, samples: u32) {
-        // Only trigger a restart if it's actually needed
-        let old_latency = self.inner.current_latency.swap(samples, Ordering::SeqCst);
-        if old_latency != samples {
-            let task_posted = unsafe { self.inner.event_loop.read().assume_init_ref() }
-                .do_maybe_async(inner::Task::TriggerRestart(
-                    vst3_sys::vst::RestartFlags::kLatencyChanged as i32,
-                ));
-            nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
-        }
-    }
-
-    fn next_midi_event(&mut self) -> Option<NoteEvent> {
-        self.input_events_guard.pop_front()
-    }
-}
-
 impl<P: Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
         Self::allocate(WrapperInner::new())
-    }
-}
-
-impl<P: Plugin> WrapperView<P> {
-    pub fn new(inner: Arc<WrapperInner<P>>, editor: Arc<dyn Editor>) -> Box<Self> {
-        Self::allocate(inner, editor, RwLock::new(None))
     }
 }
 
@@ -974,181 +916,16 @@ impl<P: Plugin> IAudioProcessor for Wrapper<P> {
     }
 }
 
-impl<P: Plugin> IPlugView for WrapperView<P> {
-    #[cfg(all(target_family = "unix", not(target_os = "macos")))]
-    unsafe fn is_platform_type_supported(&self, type_: vst3_sys::base::FIDString) -> tresult {
-        let type_ = CStr::from_ptr(type_);
-        match type_.to_str() {
-            Ok(type_) if type_ == VST3_PLATFORM_X11_WINDOW => kResultOk,
-            _ => {
-                nih_debug_assert_failure!("Invalid window handle type: {:?}", type_);
-                kResultFalse
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "macos"))]
-    unsafe fn is_platform_type_supported(&self, type_: vst3_sys::base::FIDString) -> tresult {
-        let type_ = CStr::from_ptr(type_);
-        match type_.to_str() {
-            Ok(type_) if type_ == VST3_PLATFORM_NSVIEW => kResultOk,
-            _ => {
-                nih_debug_assert_failure!("Invalid window handle type: {:?}", type_);
-                kResultFalse
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "windows"))]
-    unsafe fn is_platform_type_supported(&self, type_: vst3_sys::base::FIDString) -> tresult {
-        let type_ = CStr::from_ptr(type_);
-        match type_.to_str() {
-            Ok(type_) if type_ == VST3_PLATFORM_HWND => kResultOk,
-            _ => {
-                nih_debug_assert_failure!("Invalid window handle type: {:?}", type_);
-                kResultFalse
-            }
-        }
-    }
-
-    unsafe fn attached(&self, parent: *mut c_void, type_: vst3_sys::base::FIDString) -> tresult {
-        let mut editor_handle = self.editor_handle.write();
-        if editor_handle.is_none() {
-            let type_ = CStr::from_ptr(type_);
-            let handle = match type_.to_str() {
-                #[cfg(all(target_family = "unix", not(target_os = "macos")))]
-                Ok(type_) if type_ == VST3_PLATFORM_X11_WINDOW => {
-                    let mut handle = raw_window_handle::unix::XcbHandle::empty();
-                    handle.window = parent as usize as u32;
-                    RawWindowHandle::Xcb(handle)
-                }
-                #[cfg(all(target_os = "macos"))]
-                Ok(type_) if type_ == VST3_PLATFORM_NSVIEW => {
-                    let mut handle = raw_window_handle::macos::MacOSHandle::empty();
-                    handle.ns_view = parent;
-                    RawWindowHandle::MacOS(handle)
-                }
-                #[cfg(all(target_os = "windows"))]
-                Ok(type_) if type_ == VST3_PLATFORM_HWND => {
-                    let mut handle = raw_window_handle::windows::WindowsHandle::empty();
-                    handle.hwnd = parent;
-                    RawWindowHandle::Windows(handle)
-                }
-                _ => {
-                    nih_debug_assert_failure!("Unknown window handle type: {:?}", type_);
-                    return kInvalidArgument;
-                }
-            };
-
-            *editor_handle = Some(
-                self.editor
-                    .spawn(ParentWindowHandle { handle }, self.inner.clone()),
-            );
-            kResultOk
-        } else {
-            kResultFalse
-        }
-    }
-
-    unsafe fn removed(&self) -> tresult {
-        let mut editor_handle = self.editor_handle.write();
-        if editor_handle.is_some() {
-            *editor_handle = None;
-            kResultOk
-        } else {
-            kResultFalse
-        }
-    }
-
-    unsafe fn on_wheel(&self, _distance: f32) -> tresult {
-        // We'll let the plugin use the OS' input mechamisms because not all DAWs (or very few
-        // actually) implement these functions
-        kResultOk
-    }
-
-    unsafe fn on_key_down(
-        &self,
-        _key: vst3_sys::base::char16,
-        _key_code: i16,
-        _modifiers: i16,
-    ) -> tresult {
-        kResultOk
-    }
-
-    unsafe fn on_key_up(
-        &self,
-        _key: vst3_sys::base::char16,
-        _key_code: i16,
-        _modifiers: i16,
-    ) -> tresult {
-        kResultOk
-    }
-
-    unsafe fn get_size(&self, size: *mut vst3_sys::gui::ViewRect) -> tresult {
-        check_null_ptr!(size);
-
-        *size = mem::zeroed();
-
-        let (width, height) = self.editor.size();
-        let size = &mut *size;
-        size.left = 0;
-        size.right = width as i32;
-        size.top = 0;
-        size.bottom = height as i32;
-
-        kResultOk
-    }
-
-    unsafe fn on_size(&self, _new_size: *mut vst3_sys::gui::ViewRect) -> tresult {
-        // TODO: Implement resizing
-        kResultOk
-    }
-
-    unsafe fn on_focus(&self, _state: TBool) -> tresult {
-        kResultOk
-    }
-
-    unsafe fn set_frame(&self, _frame: *mut c_void) -> tresult {
-        // TODO: Implement resizing. We don't implement that right now, so we also don't need the
-        //       plug frame.
-        kResultOk
-    }
-
-    unsafe fn can_resize(&self) -> tresult {
-        // TODO: Implement resizing
-        kResultFalse
-    }
-
-    unsafe fn check_size_constraint(&self, rect: *mut vst3_sys::gui::ViewRect) -> tresult {
-        check_null_ptr!(rect);
-
-        // TODO: Add this with the resizing
-        if (*rect).right - (*rect).left > 0 && (*rect).bottom - (*rect).top > 0 {
-            kResultOk
-        } else {
-            kResultFalse
-        }
-    }
-}
-
 #[doc(hidden)]
 #[VST3(implements(IPluginFactory, IPluginFactory2, IPluginFactory3))]
 pub struct Factory<P: Vst3Plugin> {
-    /// The exposed plugin's GUID. Instead of generating this, we'll just let the programmer decide
-    /// on their own.
-    cid: GUID,
     /// The type will be used for constructing plugin instances later.
     _phantom: PhantomData<P>,
 }
 
 impl<P: Vst3Plugin> Factory<P> {
     pub fn new() -> Box<Self> {
-        Self::allocate(
-            GUID {
-                data: P::VST3_CLASS_ID,
-            },
-            PhantomData::default(),
-        )
+        Self::allocate(PhantomData::default())
     }
 }
 
@@ -1180,7 +957,7 @@ impl<P: Vst3Plugin> IPluginFactory for Factory<P> {
         *info = mem::zeroed();
 
         let info = &mut *info;
-        info.cid = self.cid;
+        info.cid.data = P::VST3_CLASS_ID;
         info.cardinality = vst3_sys::base::ClassCardinality::kManyInstances as i32;
         strlcpy(&mut info.category, "Audio Module Class");
         strlcpy(&mut info.name, P::NAME);
@@ -1196,7 +973,7 @@ impl<P: Vst3Plugin> IPluginFactory for Factory<P> {
     ) -> tresult {
         check_null_ptr!(cid, obj);
 
-        if *cid != self.cid {
+        if (*cid).data != P::VST3_CLASS_ID {
             return kNoInterface;
         }
 
@@ -1219,7 +996,7 @@ impl<P: Vst3Plugin> IPluginFactory2 for Factory<P> {
         *info = mem::zeroed();
 
         let info = &mut *info;
-        info.cid = self.cid;
+        info.cid.data = P::VST3_CLASS_ID;
         info.cardinality = vst3_sys::base::ClassCardinality::kManyInstances as i32;
         strlcpy(&mut info.category, "Audio Module Class");
         strlcpy(&mut info.name, P::NAME);
@@ -1246,7 +1023,7 @@ impl<P: Vst3Plugin> IPluginFactory3 for Factory<P> {
         *info = mem::zeroed();
 
         let info = &mut *info;
-        info.cid = self.cid;
+        info.cid.data = P::VST3_CLASS_ID;
         info.cardinality = vst3_sys::base::ClassCardinality::kManyInstances as i32;
         strlcpy(&mut info.category, "Audio Module Class");
         u16strlcpy(&mut info.name, P::NAME);
@@ -1312,13 +1089,13 @@ macro_rules! nih_export_vst3 {
         // https://github.com/steinbergmedia/vst3_public_sdk/blob/bc459feee68803346737901471441fd4829ec3f9/source/main/dllmain.cpp#L59-L60
         #[no_mangle]
         #[cfg(target_os = "windows")]
-        pub extern "system" fn InitModule() -> bool {
+        pub extern "system" fn InitDll() -> bool {
             true
         }
 
         #[no_mangle]
         #[cfg(target_os = "windows")]
-        pub extern "system" fn DeinitModule() -> bool {
+        pub extern "system" fn ExitDll() -> bool {
             true
         }
     };

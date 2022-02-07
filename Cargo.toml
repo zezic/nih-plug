@@ -18,6 +18,7 @@ members = [
   "plugins/examples/gain",
   "plugins/examples/gain-gui",
   "plugins/examples/sine",
+  "plugins/examples/vu",
 ]
 
 [dependencies]
@@ -45,4 +46,4 @@ assert_process_allocs = ["assert_no_alloc"]
 
 # Upstream baseview doesn't work in REAPER because of mismatching visuals
 [patch."https://github.com/RustAudio/baseview.git"]
-baseview = { git = "https://github.com/prokopyl/baseview.git", rev = "6f7068e4f3391b7f977f8595619d4fe2c1dfd84f" }
+baseview = { git = "https://github.com/robbert-vdh/baseview.git", rev = "3551d5e25329ff34b8a0e350bfd33be608cfc8ab" }

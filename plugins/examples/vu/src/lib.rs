@@ -152,7 +152,7 @@ impl Plugin for Vu {
 
                     for chan_idx in 0..2 {
                         let motion_blur_color =
-                            Color32::from_rgb(0x80, 0x80, 0x80);
+                            Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x80);
 
                         let hand_color = Color32::from_gray(0xFF);
                         let stroke_h = Stroke::new(1.0, hand_color);
